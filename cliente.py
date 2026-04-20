@@ -6,9 +6,10 @@ import os
 import time
 import base64
 
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, dh
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -26,6 +27,11 @@ class ChatClientGUI:
         self.is_typing = False
         self.last_key_press_time = 0
         self.local_aes_key = None 
+        
+        self.session_aes_key = None
+        self.session_hmac_key = None
+        self.dh_private_key = None
+        self.dh_salt = None
 
     def create_login_frame(self):
         frame = tk.Frame(self.master, padx=10, pady=10)
@@ -48,15 +54,76 @@ class ChatClientGUI:
         password = self.entry_password.get()
         threading.Thread(target=self.login_thread_handler, args=(username, password), daemon=True).start()
 
+    def sign_challenge(self, nonce_base64):
+        priv_path = os.path.join("keys", f"{self.current_username}_priv.pem")
+        
+        if not os.path.exists(priv_path):
+            return None 
+            
+        with open(priv_path, "rb") as key_file:
+            private_key = serialization.load_pem_private_key(
+                key_file.read(),
+                password=None
+            )
+            
+        nonce_bytes = base64.b64decode(nonce_base64)
+        signature = private_key.sign(nonce_bytes)
+        return base64.b64encode(signature).decode('utf-8')
+
+    def execute_handshake(self):
+        print("[INFO] Gerando chaves Diffie-Hellman (isso pode levar alguns segundos)...")
+        parameters = dh.generate_parameters(generator=2, key_size=2048)
+        self.dh_private_key = parameters.generate_private_key()
+        client_pub = self.dh_private_key.public_key()
+        
+        client_pub_bytes = client_pub.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        
+        self.dh_salt = os.urandom(16)
+        
+        msg = f"HANDSHAKE|{base64.b64encode(client_pub_bytes).decode('utf-8')}|{base64.b64encode(self.dh_salt).decode('utf-8')}"
+        try:
+            self.client_socket.sendall(msg.encode('utf-8'))
+            print("[INFO] Handshake enviado ao servidor. Aguardando resposta...")
+        except socket.error:
+            pass
+
     def login_thread_handler(self, username, password):
         if self.connect_to_server():
+            self.current_username = username 
+            
             message = f"LOGIN|{username}|{password}"
             self.client_socket.sendall(message.encode('utf-8'))
             response = self.client_socket.recv(1024).decode('utf-8')
             
-            if response.startswith("LOGIN_OK"):
-                self.current_username = username
+            if response.startswith("CHALLENGE"):
+                parts = response.split('|')
+                nonce_base64 = parts[1]
+                
+                signature_base64 = self.sign_challenge(nonce_base64)
+                
+                if signature_base64:
+                    msg_resposta = f"CHALLENGE_RESPONSE|{signature_base64}"
+                    self.client_socket.sendall(msg_resposta.encode('utf-8'))
+                    
+                    final_response = self.client_socket.recv(1024).decode('utf-8')
+                    if final_response.startswith("LOGIN_OK"):
+                        self.load_or_generate_identity() 
+                        self.execute_handshake()
+                        self.master.after(0, self.show_chat_window)
+                        threading.Thread(target=self.receive_messages, daemon=True).start()
+                    else:
+                        self.master.after(0, lambda: messagebox.showerror("Login Falhou", final_response))
+                        self.client_socket.close()
+                else:
+                    self.master.after(0, lambda: messagebox.showerror("Erro", "Chave privada não encontrada nesta máquina. Faça o registro primeiro."))
+                    self.client_socket.close()
+                    
+            elif response.startswith("LOGIN_OK"):
                 self.load_or_generate_identity() 
+                self.execute_handshake()
                 self.master.after(0, self.show_chat_window)
                 threading.Thread(target=self.receive_messages, daemon=True).start()
             else:
@@ -79,7 +146,8 @@ class ChatClientGUI:
             self.client_socket.connect((HOST, PORT))
             return True
         except socket.error as e:
-            self.master.after(0, lambda: messagebox.showerror("Erro de Conexão", f"Não foi possível conectar ao servidor: {e}"))
+            mensagem_erro = f"Não foi possível conectar ao servidor: {e}"
+            self.master.after(0, lambda: messagebox.showerror("Erro de Conexão", mensagem_erro))
             return False
         
     def load_or_generate_identity(self):
@@ -205,14 +273,31 @@ class ChatClientGUI:
     def receive_messages(self):
         while True:
             try:
-                data = self.client_socket.recv(1024).decode('utf-8')
+                data = self.client_socket.recv(4096).decode('utf-8')
                 if not data:
                     break
                 
                 parts = data.split('|')
                 command = parts[0]
 
-                if command == "MESSAGE":
+                if command == "HANDSHAKE_RESPONSE":
+                    server_pub_bytes = base64.b64decode(parts[1])
+                    server_pub = serialization.load_pem_public_key(server_pub_bytes)
+                    shared_secret = self.dh_private_key.exchange(server_pub)
+                    
+                    hkdf = HKDF(
+                        algorithm=hashes.SHA256(),
+                        length=64,
+                        salt=self.dh_salt,
+                        info=b"chat_session_keys"
+                    )
+                    key_material = hkdf.derive(shared_secret)
+                    
+                    self.session_aes_key = key_material[:32]
+                    self.session_hmac_key = key_material[32:]
+                    print("[INFO] Handshake concluído! Chaves de sessão (AES e HMAC) estabelecidas.")
+
+                elif command == "MESSAGE":
                     sender = parts[1]
                     message = parts[2]
                     self.master.after(0, lambda: self.handle_message_received(sender, message))
@@ -308,8 +393,12 @@ class ChatClientGUI:
     def on_closing(self):
         if messagebox.askokcancel("Sair", "Tem certeza que deseja sair?"):
             if self.client_socket:
-                self.client_socket.sendall("LOGOUT".encode('utf-8'))
-                self.client_socket.close()
+                try:
+                    self.client_socket.sendall("LOGOUT".encode('utf-8'))
+                except socket.error:
+                    pass
+                finally:
+                    self.client_socket.close()
             self.master.destroy()
             
     def get_history_filename(self, contact):
