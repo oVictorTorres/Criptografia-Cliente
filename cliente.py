@@ -4,6 +4,11 @@ import socket
 import threading
 import os
 import time
+import base64
+
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -20,6 +25,7 @@ class ChatClientGUI:
         self.typing_status_thread = None
         self.is_typing = False
         self.last_key_press_time = 0
+        self.local_aes_key = None 
 
     def create_login_frame(self):
         frame = tk.Frame(self.master, padx=10, pady=10)
@@ -50,6 +56,7 @@ class ChatClientGUI:
             
             if response.startswith("LOGIN_OK"):
                 self.current_username = username
+                self.load_or_generate_identity() 
                 self.master.after(0, self.show_chat_window)
                 threading.Thread(target=self.receive_messages, daemon=True).start()
             else:
@@ -74,6 +81,39 @@ class ChatClientGUI:
         except socket.error as e:
             self.master.after(0, lambda: messagebox.showerror("Erro de Conexão", f"Não foi possível conectar ao servidor: {e}"))
             return False
+        
+    def load_or_generate_identity(self):
+        keys_dir = "keys"
+        if not os.path.exists(keys_dir):
+            os.makedirs(keys_dir)
+
+        priv_path = os.path.join(keys_dir, f"{self.current_username}_priv.pem")
+        pub_path = os.path.join(keys_dir, f"{self.current_username}_pub.pem")
+        aes_path = os.path.join(keys_dir, f"{self.current_username}_aes.key")
+
+        if not os.path.exists(priv_path):
+            private_key = ed25519.Ed25519PrivateKey.generate()
+            public_key = private_key.public_key()
+
+            with open(priv_path, "wb") as f:
+                f.write(private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+
+            with open(pub_path, "wb") as f:
+                f.write(public_key.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                ))
+
+            chave_aes = AESGCM.generate_key(bit_length=256)
+            with open(aes_path, "wb") as f:
+                f.write(chave_aes)
+            
+        with open(aes_path, "rb") as f:
+            self.local_aes_key = f.read()
 
     def get_contacts_list(self):
         message = "GET_CONTACTS"
@@ -123,11 +163,8 @@ class ChatClientGUI:
             self.chatting_with = self.contacts_listbox.get(selected_index[0])
             self.master.title(f"Chat - {self.current_username} (Conversando com {self.chatting_with})")
             self.chat_history.config(state='normal')
-            
             self.chat_history.delete('1.0', tk.END)
-            
             self.load_chat_history()
-            
             self.chat_history.config(state='disabled')
 
     def send_message(self):
@@ -135,9 +172,8 @@ class ChatClientGUI:
         if message and self.chatting_with:
             message_to_send = f"MESSAGE|{self.chatting_with}|{message}"
             self.client_socket.sendall(message_to_send.encode('utf-8'))
-            self.update_chat_history(f"Você: {message}", True) # Passa True para salvar
+            self.update_chat_history(f"Você: {message}", True) 
 
-            # Ajusta o foco para a entrada de texto e limpa
             self.message_entry.delete(0, tk.END)
             self.send_typing_stop()
 
@@ -214,13 +250,9 @@ class ChatClientGUI:
         self.client_socket.close()
 
     def handle_message_received(self, sender, message):
-        """Processa a mensagem recebida e a salva no histórico, independente da conversa aberta."""
-        # Salva a mensagem no histórico do contato
         self.save_chat_history_direct(sender, f"{sender}: {message}")
-        
-        # Se a conversa com o remetente estiver aberta, atualiza a GUI
         if self.chatting_with == sender:
-            self.update_chat_history(f"{sender}: {message}", False) # Passa False para não salvar de novo
+            self.update_chat_history(f"{sender}: {message}", False) 
 
     def update_contacts_list(self, contacts_with_status):
         self.contacts_listbox.delete(0, tk.END)
@@ -234,38 +266,44 @@ class ChatClientGUI:
                 self.contacts_listbox.insert(tk.END, contact_with_status)
 
     def update_contacts_status(self, username, status):
-        # Lógica para atualizar a cor do contato na lista
         pass
 
     def update_chat_history(self, message, is_sent_message):
-        """Atualiza a caixa de texto da conversa e salva a mensagem no arquivo."""
         self.chat_history.config(state='normal')
         self.chat_history.insert(tk.END, message + "\n")
         self.chat_history.config(state='disabled')
         self.chat_history.see(tk.END)
         if is_sent_message:
-            self.save_chat_history(self.chatting_with, message)
-
-    def save_chat_history(self, contact, message):
-        """Salva a mensagem no arquivo de histórico de um contato específico."""
-        file_path = self.get_history_filename(contact)
-        with open(file_path, "a") as f:
-            f.write(message + "\n")
+            self.save_chat_history_direct(self.chatting_with, message)
 
     def save_chat_history_direct(self, contact, message):
-        """Salva a mensagem no arquivo de histórico de um contato específico."""
         file_path = self.get_history_filename(contact) 
-        with open(file_path, "a") as f:
-            f.write(message + "\n")
+        if self.local_aes_key:
+            aesgcm = AESGCM(self.local_aes_key)
+            nonce = os.urandom(12)
+            texto_cifrado = aesgcm.encrypt(nonce, message.encode('utf-8'), associated_data=None)
+            pacote = base64.b64encode(nonce + texto_cifrado).decode('utf-8')
+            with open(file_path, "a") as f:
+                f.write(pacote + "\n")
             
     def load_chat_history(self):
-        """Carrega o histórico de conversa do arquivo."""
         if self.chatting_with:
             file_path = self.get_history_filename(self.chatting_with) 
             if os.path.exists(file_path):
-                with open(file_path, "r") as f:
-                    history = f.read()
-                    self.chat_history.insert(tk.END, history)
+                if self.local_aes_key:
+                    aesgcm = AESGCM(self.local_aes_key)
+                    with open(file_path, "r") as f:
+                        for linha in f:
+                            linha = linha.strip()
+                            if linha:
+                                try:
+                                    pacote_bytes = base64.b64decode(linha)
+                                    nonce = pacote_bytes[:12]
+                                    texto_cifrado = pacote_bytes[12:]
+                                    texto_decifrado = aesgcm.decrypt(nonce, texto_cifrado, associated_data=None)
+                                    self.chat_history.insert(tk.END, texto_decifrado.decode('utf-8') + "\n")
+                                except Exception as e:
+                                    print(f"Erro ao ler linha criptografada: {e}")
 
     def on_closing(self):
         if messagebox.askokcancel("Sair", "Tem certeza que deseja sair?"):
@@ -273,14 +311,12 @@ class ChatClientGUI:
                 self.client_socket.sendall("LOGOUT".encode('utf-8'))
                 self.client_socket.close()
             self.master.destroy()
+            
     def get_history_filename(self, contact):
         history_dir = "chat_history"
         if not os.path.exists(history_dir):
             os.makedirs(history_dir)
-        
-        # Ordena os nomes de usuário para criar um nome de arquivo consistente
-        usernames = sorted([self.current_username, contact])
-        filename = f"{usernames[0]}_{usernames[1]}.txt"
+        filename = f"history_{self.current_username}_{contact}.txt"
         return os.path.join(history_dir, filename)
 
 if __name__ == "__main__":
