@@ -10,7 +10,6 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, dh
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hmac
 
 HOST = '127.0.0.1'
@@ -93,32 +92,28 @@ class ChatClientGUI:
             pass
 
     def encrypt_and_mac(self, plaintext_bytes, aes_key, hmac_key):
-        iv = os.urandom(16)
-        cipher = Cipher(algorithms.AES(aes_key), modes.CTR(iv))
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(plaintext_bytes) + encryptor.finalize()
+        aesgcm = AESGCM(aes_key)
+        nonce = os.urandom(12)
+        ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, None)
         
         h = hmac.HMAC(hmac_key, hashes.SHA256())
-        h.update(iv + ciphertext)
+        h.update(ciphertext)
         mac = h.finalize()
         
-        pacote = iv + ciphertext + mac
-        return base64.b64encode(pacote).decode('utf-8')
+        return base64.b64encode(nonce).decode('utf-8'), base64.b64encode(ciphertext).decode('utf-8'), base64.b64encode(mac).decode('utf-8')
 
-    def verify_and_decrypt(self, pacote_base64, aes_key, hmac_key):
+    def verify_and_decrypt(self, nonce_b64, ciphertext_b64, mac_b64, aes_key, hmac_key):
         try:
-            pacote_bytes = base64.b64decode(pacote_base64)
-            mac_recebido = pacote_bytes[-32:]
-            iv_recebido = pacote_bytes[:16]
-            ciphertext_recebido = pacote_bytes[16:-32]
+            nonce = base64.b64decode(nonce_b64)
+            ciphertext = base64.b64decode(ciphertext_b64)
+            mac_recebido = base64.b64decode(mac_b64)
             
             h = hmac.HMAC(hmac_key, hashes.SHA256())
-            h.update(iv_recebido + ciphertext_recebido)
+            h.update(ciphertext)
             h.verify(mac_recebido) 
             
-            cipher = Cipher(algorithms.AES(aes_key), modes.CTR(iv_recebido))
-            decryptor = cipher.decryptor()
-            plaintext_bytes = decryptor.update(ciphertext_recebido) + decryptor.finalize()
+            aesgcm = AESGCM(aes_key)
+            plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, None)
             return plaintext_bytes
         except Exception:
             return None
@@ -164,8 +159,18 @@ class ChatClientGUI:
     def handle_register(self):
         username = self.entry_username.get()
         password = self.entry_password.get()
+        
+        self.current_username = username
+        self.load_or_generate_identity()
+        
+        pub_path = os.path.join("keys", f"{username}_pub.pem")
+        with open(pub_path, "rb") as f:
+            pub_pem = f.read()
+            
+        pub_b64 = base64.b64encode(pub_pem).decode('utf-8')
+        
         if self.connect_to_server():
-            message = f"REGISTER|{username}|{password}"
+            message = f"REGISTER|{username}|{password}|{pub_b64}"
             self.client_socket.sendall(message.encode('utf-8'))
             response = self.client_socket.recv(1024).decode('utf-8')
             messagebox.showinfo("Registro", response)
@@ -276,12 +281,13 @@ class ChatClientGUI:
             e2e_aes = self.e2e_keys[self.chatting_with]['aes']
             e2e_hmac = self.e2e_keys[self.chatting_with]['hmac']
             
-            inner_payload = self.encrypt_and_mac(message.encode('utf-8'), e2e_aes, e2e_hmac)
+            nonce_in, cipher_in, mac_in = self.encrypt_and_mac(message.encode('utf-8'), e2e_aes, e2e_hmac)
+            inner_payload = f"{nonce_in}|{cipher_in}|{mac_in}"
             
             if self.session_aes_key and self.session_hmac_key:
-                outer_message = f"ROUTED_MSG|{self.chatting_with}|{inner_payload}"
-                outer_payload = self.encrypt_and_mac(outer_message.encode('utf-8'), self.session_aes_key, self.session_hmac_key)
-                final_msg = f"SECURE_MESSAGE|{outer_payload}"
+                outer_content = f"ROUTED_MSG|{self.chatting_with}|{inner_payload}"
+                nonce_out, cipher_out, mac_out = self.encrypt_and_mac(outer_content.encode('utf-8'), self.session_aes_key, self.session_hmac_key)
+                final_msg = f"SECURE_MESSAGE|{self.chatting_with}|{nonce_out}|{cipher_out}|{mac_out}"
             else:
                 final_msg = f"MESSAGE|{self.chatting_with}|{message}"
                 
@@ -327,14 +333,19 @@ class ChatClientGUI:
                 command = parts[0]
 
                 if command == "SECURE_MESSAGE":
-                    outer_payload = parts[1]
-                    decrypted_outer = self.verify_and_decrypt(outer_payload, self.session_aes_key, self.session_hmac_key)
+                    nonce_out = parts[1]
+                    cipher_out = parts[2]
+                    mac_out = parts[3]
+                    
+                    decrypted_outer = self.verify_and_decrypt(nonce_out, cipher_out, mac_out, self.session_aes_key, self.session_hmac_key)
                     
                     if decrypted_outer:
                         inner_parts = decrypted_outer.decode('utf-8').split('|')
                         if inner_parts[0] == "ROUTED_MSG_FROM":
                             sender = inner_parts[1]
-                            inner_payload = inner_parts[2]
+                            nonce_in = inner_parts[2]
+                            cipher_in = inner_parts[3]
+                            mac_in = inner_parts[4]
                             
                             if sender not in self.e2e_keys:
                                 self.e2e_keys[sender] = {'aes': b'0'*32, 'hmac': b'1'*32}
@@ -342,7 +353,7 @@ class ChatClientGUI:
                             e2e_aes = self.e2e_keys[sender]['aes']
                             e2e_hmac = self.e2e_keys[sender]['hmac']
                             
-                            plaintext_bytes = self.verify_and_decrypt(inner_payload, e2e_aes, e2e_hmac)
+                            plaintext_bytes = self.verify_and_decrypt(nonce_in, cipher_in, mac_in, e2e_aes, e2e_hmac)
                             if plaintext_bytes:
                                 plaintext_msg = plaintext_bytes.decode('utf-8')
                                 self.master.after(0, lambda s=sender, m=plaintext_msg: self.handle_message_received(s, m))
@@ -432,7 +443,7 @@ class ChatClientGUI:
         if self.local_aes_key:
             aesgcm = AESGCM(self.local_aes_key)
             nonce = os.urandom(12)
-            texto_cifrado = aesgcm.encrypt(nonce, message.encode('utf-8'), associated_data=None)
+            texto_cifrado = aesgcm.encrypt(nonce, message.encode('utf-8'), None)
             pacote = base64.b64encode(nonce + texto_cifrado).decode('utf-8')
             with open(file_path, "a") as f:
                 f.write(pacote + "\n")
@@ -451,10 +462,10 @@ class ChatClientGUI:
                                     pacote_bytes = base64.b64decode(linha)
                                     nonce = pacote_bytes[:12]
                                     texto_cifrado = pacote_bytes[12:]
-                                    texto_decifrado = aesgcm.decrypt(nonce, texto_cifrado, associated_data=None)
+                                    texto_decifrado = aesgcm.decrypt(nonce, texto_cifrado, None)
                                     self.chat_history.insert(tk.END, texto_decifrado.decode('utf-8') + "\n")
-                                except Exception as e:
-                                    print(f"Erro ao ler linha criptografada: {e}")
+                                except Exception:
+                                    pass
 
     def on_closing(self):
         if messagebox.askokcancel("Sair", "Tem certeza que deseja sair?"):
