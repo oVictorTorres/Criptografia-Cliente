@@ -10,6 +10,8 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, dh
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hmac
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -32,6 +34,8 @@ class ChatClientGUI:
         self.session_hmac_key = None
         self.dh_private_key = None
         self.dh_salt = None
+        
+        self.e2e_keys = {}
 
     def create_login_frame(self):
         frame = tk.Frame(self.master, padx=10, pady=10)
@@ -71,7 +75,6 @@ class ChatClientGUI:
         return base64.b64encode(signature).decode('utf-8')
 
     def execute_handshake(self):
-        print("[INFO] Gerando chaves Diffie-Hellman (isso pode levar alguns segundos)...")
         parameters = dh.generate_parameters(generator=2, key_size=2048)
         self.dh_private_key = parameters.generate_private_key()
         client_pub = self.dh_private_key.public_key()
@@ -86,14 +89,43 @@ class ChatClientGUI:
         msg = f"HANDSHAKE|{base64.b64encode(client_pub_bytes).decode('utf-8')}|{base64.b64encode(self.dh_salt).decode('utf-8')}"
         try:
             self.client_socket.sendall(msg.encode('utf-8'))
-            print("[INFO] Handshake enviado ao servidor. Aguardando resposta...")
         except socket.error:
             pass
+
+    def encrypt_and_mac(self, plaintext_bytes, aes_key, hmac_key):
+        iv = os.urandom(16)
+        cipher = Cipher(algorithms.AES(aes_key), modes.CTR(iv))
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(plaintext_bytes) + encryptor.finalize()
+        
+        h = hmac.HMAC(hmac_key, hashes.SHA256())
+        h.update(iv + ciphertext)
+        mac = h.finalize()
+        
+        pacote = iv + ciphertext + mac
+        return base64.b64encode(pacote).decode('utf-8')
+
+    def verify_and_decrypt(self, pacote_base64, aes_key, hmac_key):
+        try:
+            pacote_bytes = base64.b64decode(pacote_base64)
+            mac_recebido = pacote_bytes[-32:]
+            iv_recebido = pacote_bytes[:16]
+            ciphertext_recebido = pacote_bytes[16:-32]
+            
+            h = hmac.HMAC(hmac_key, hashes.SHA256())
+            h.update(iv_recebido + ciphertext_recebido)
+            h.verify(mac_recebido) 
+            
+            cipher = Cipher(algorithms.AES(aes_key), modes.CTR(iv_recebido))
+            decryptor = cipher.decryptor()
+            plaintext_bytes = decryptor.update(ciphertext_recebido) + decryptor.finalize()
+            return plaintext_bytes
+        except Exception:
+            return None
 
     def login_thread_handler(self, username, password):
         if self.connect_to_server():
             self.current_username = username 
-            
             message = f"LOGIN|{username}|{password}"
             self.client_socket.sendall(message.encode('utf-8'))
             response = self.client_socket.recv(1024).decode('utf-8')
@@ -101,7 +133,6 @@ class ChatClientGUI:
             if response.startswith("CHALLENGE"):
                 parts = response.split('|')
                 nonce_base64 = parts[1]
-                
                 signature_base64 = self.sign_challenge(nonce_base64)
                 
                 if signature_base64:
@@ -118,7 +149,7 @@ class ChatClientGUI:
                         self.master.after(0, lambda: messagebox.showerror("Login Falhou", final_response))
                         self.client_socket.close()
                 else:
-                    self.master.after(0, lambda: messagebox.showerror("Erro", "Chave privada não encontrada nesta máquina. Faça o registro primeiro."))
+                    self.master.after(0, lambda: messagebox.showerror("Erro", "Chave privada ausente."))
                     self.client_socket.close()
                     
             elif response.startswith("LOGIN_OK"):
@@ -238,8 +269,23 @@ class ChatClientGUI:
     def send_message(self):
         message = self.message_entry.get()
         if message and self.chatting_with:
-            message_to_send = f"MESSAGE|{self.chatting_with}|{message}"
-            self.client_socket.sendall(message_to_send.encode('utf-8'))
+            
+            if self.chatting_with not in self.e2e_keys:
+                self.e2e_keys[self.chatting_with] = {'aes': b'0'*32, 'hmac': b'1'*32}
+
+            e2e_aes = self.e2e_keys[self.chatting_with]['aes']
+            e2e_hmac = self.e2e_keys[self.chatting_with]['hmac']
+            
+            inner_payload = self.encrypt_and_mac(message.encode('utf-8'), e2e_aes, e2e_hmac)
+            
+            if self.session_aes_key and self.session_hmac_key:
+                outer_message = f"ROUTED_MSG|{self.chatting_with}|{inner_payload}"
+                outer_payload = self.encrypt_and_mac(outer_message.encode('utf-8'), self.session_aes_key, self.session_hmac_key)
+                final_msg = f"SECURE_MESSAGE|{outer_payload}"
+            else:
+                final_msg = f"MESSAGE|{self.chatting_with}|{message}"
+                
+            self.client_socket.sendall(final_msg.encode('utf-8'))
             self.update_chat_history(f"Você: {message}", True) 
 
             self.message_entry.delete(0, tk.END)
@@ -280,7 +326,28 @@ class ChatClientGUI:
                 parts = data.split('|')
                 command = parts[0]
 
-                if command == "HANDSHAKE_RESPONSE":
+                if command == "SECURE_MESSAGE":
+                    outer_payload = parts[1]
+                    decrypted_outer = self.verify_and_decrypt(outer_payload, self.session_aes_key, self.session_hmac_key)
+                    
+                    if decrypted_outer:
+                        inner_parts = decrypted_outer.decode('utf-8').split('|')
+                        if inner_parts[0] == "ROUTED_MSG_FROM":
+                            sender = inner_parts[1]
+                            inner_payload = inner_parts[2]
+                            
+                            if sender not in self.e2e_keys:
+                                self.e2e_keys[sender] = {'aes': b'0'*32, 'hmac': b'1'*32}
+                            
+                            e2e_aes = self.e2e_keys[sender]['aes']
+                            e2e_hmac = self.e2e_keys[sender]['hmac']
+                            
+                            plaintext_bytes = self.verify_and_decrypt(inner_payload, e2e_aes, e2e_hmac)
+                            if plaintext_bytes:
+                                plaintext_msg = plaintext_bytes.decode('utf-8')
+                                self.master.after(0, lambda s=sender, m=plaintext_msg: self.handle_message_received(s, m))
+
+                elif command == "HANDSHAKE_RESPONSE":
                     server_pub_bytes = base64.b64decode(parts[1])
                     server_pub = serialization.load_pem_public_key(server_pub_bytes)
                     shared_secret = self.dh_private_key.exchange(server_pub)
@@ -295,7 +362,6 @@ class ChatClientGUI:
                     
                     self.session_aes_key = key_material[:32]
                     self.session_hmac_key = key_material[32:]
-                    print("[INFO] Handshake concluído! Chaves de sessão (AES e HMAC) estabelecidas.")
 
                 elif command == "MESSAGE":
                     sender = parts[1]
