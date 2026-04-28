@@ -5,8 +5,10 @@ import threading
 import os
 import time
 import base64
+import json
+import re
 
-from cryptography.hazmat.primitives.asymmetric import ed25519, dh
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -33,6 +35,7 @@ class ChatClientGUI:
         self.session_hmac_key = None
         self.dh_private_key = None
         self.dh_salt = None
+        self.current_session_id = None
         
         self.e2e_keys = {}
 
@@ -54,8 +57,7 @@ class ChatClientGUI:
 
     def handle_login(self):
         username = self.entry_username.get()
-        password = self.entry_password.get()
-        threading.Thread(target=self.login_thread_handler, args=(username, password), daemon=True).start()
+        threading.Thread(target=self.login_thread_handler, args=(username,), daemon=True).start()
 
     def sign_challenge(self, nonce_base64):
         priv_path = os.path.join("keys", f"{self.current_username}_priv.pem")
@@ -74,13 +76,12 @@ class ChatClientGUI:
         return base64.b64encode(signature).decode('utf-8')
 
     def execute_handshake(self):
-        parameters = dh.generate_parameters(generator=2, key_size=2048)
-        self.dh_private_key = parameters.generate_private_key()
+        self.dh_private_key = x25519.X25519PrivateKey.generate()
         client_pub = self.dh_private_key.public_key()
         
         client_pub_bytes = client_pub.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
         )
         
         self.dh_salt = os.urandom(16)
@@ -118,43 +119,44 @@ class ChatClientGUI:
         except Exception:
             return None
 
-    def login_thread_handler(self, username, password):
+    def login_thread_handler(self, username):
         if self.connect_to_server():
             self.current_username = username 
-            message = f"LOGIN|{username}|{password}"
-            self.client_socket.sendall(message.encode('utf-8'))
-            response = self.client_socket.recv(1024).decode('utf-8')
             
-            if response.startswith("CHALLENGE"):
-                parts = response.split('|')
-                nonce_base64 = parts[1]
-                signature_base64 = self.sign_challenge(nonce_base64)
+            message = f"LOGIN_REQUEST|{username}"
+            self.client_socket.sendall(message.encode('utf-8'))
+            
+            try:
+                response = self.client_socket.recv(1024).decode('utf-8')
                 
-                if signature_base64:
-                    msg_resposta = f"CHALLENGE_RESPONSE|{signature_base64}"
-                    self.client_socket.sendall(msg_resposta.encode('utf-8'))
+                if response.startswith("CHALLENGE"):
+                    parts = response.split('|')
+                    nonce_base64 = parts[1]
+                    signature_base64 = self.sign_challenge(nonce_base64)
                     
-                    final_response = self.client_socket.recv(1024).decode('utf-8')
-                    if final_response.startswith("LOGIN_OK"):
-                        self.load_or_generate_identity() 
-                        self.execute_handshake()
-                        self.master.after(0, self.show_chat_window)
-                        threading.Thread(target=self.receive_messages, daemon=True).start()
+                    if signature_base64:
+                        msg_resposta = f"LOGIN|{username}|{signature_base64}"
+                        self.client_socket.sendall(msg_resposta.encode('utf-8'))
+                        
+                        final_response = self.client_socket.recv(1024).decode('utf-8')
+                        
+                        if final_response.startswith("LOGIN_OK") or "LOGIN_OK" in final_response:
+                            self.load_or_generate_identity() 
+                            self.execute_handshake()
+                            self.master.after(0, self.show_chat_window)
+                            threading.Thread(target=self.receive_messages, daemon=True).start()
+                        else:
+                            self.master.after(0, lambda: messagebox.showerror("Login Falhou", final_response))
+                            self.client_socket.close()
                     else:
-                        self.master.after(0, lambda: messagebox.showerror("Login Falhou", final_response))
+                        self.master.after(0, lambda: messagebox.showerror("Erro", "Chave privada ausente."))
                         self.client_socket.close()
+                        
                 else:
-                    self.master.after(0, lambda: messagebox.showerror("Erro", "Chave privada ausente."))
+                    self.master.after(0, lambda: messagebox.showerror("Login Falhou", response))
                     self.client_socket.close()
-                    
-            elif response.startswith("LOGIN_OK"):
-                self.load_or_generate_identity() 
-                self.execute_handshake()
-                self.master.after(0, self.show_chat_window)
-                threading.Thread(target=self.receive_messages, daemon=True).start()
-            else:
-                self.master.after(0, lambda: messagebox.showerror("Login Falhou", response))
-                self.client_socket.close()
+            except socket.error:
+                pass
 
     def handle_register(self):
         username = self.entry_username.get()
@@ -167,7 +169,12 @@ class ChatClientGUI:
         with open(pub_path, "rb") as f:
             pub_pem = f.read()
             
-        pub_b64 = base64.b64encode(pub_pem).decode('utf-8')
+        public_key = serialization.load_pem_public_key(pub_pem)
+        pub_raw = public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+        pub_b64 = base64.b64encode(pub_raw).decode('utf-8')
         
         if self.connect_to_server():
             message = f"REGISTER|{username}|{password}|{pub_b64}"
@@ -222,7 +229,10 @@ class ChatClientGUI:
     def get_contacts_list(self):
         message = "GET_CONTACTS"
         if self.client_socket:
-            self.client_socket.sendall(message.encode('utf-8'))
+            try:
+                self.client_socket.sendall(message.encode('utf-8'))
+            except socket.error:
+                pass
 
     def show_chat_window(self):
         self.login_frame.destroy()
@@ -240,6 +250,8 @@ class ChatClientGUI:
         self.contacts_listbox = tk.Listbox(contacts_frame)
         self.contacts_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.contacts_listbox.bind("<<ListboxSelect>>", self.on_contact_select)
+        
+        time.sleep(0.5)
         self.get_contacts_list()
 
         self.chat_history = tk.Text(main_frame, state='disabled', wrap='word')
@@ -287,7 +299,14 @@ class ChatClientGUI:
             if self.session_aes_key and self.session_hmac_key:
                 outer_content = f"ROUTED_MSG|{self.chatting_with}|{inner_payload}"
                 nonce_out, cipher_out, mac_out = self.encrypt_and_mac(outer_content.encode('utf-8'), self.session_aes_key, self.session_hmac_key)
-                final_msg = f"SECURE_MESSAGE|{self.chatting_with}|{nonce_out}|{cipher_out}|{mac_out}"
+                
+                payload_dict = {
+                    "nonce_b64": nonce_out,
+                    "ciphertext_b64": cipher_out,
+                    "mac_b64": mac_out,
+                    "recipient": self.chatting_with
+                }
+                final_msg = f"SECURE_MESSAGE|{json.dumps(payload_dict)}"
             else:
                 final_msg = f"MESSAGE|{self.chatting_with}|{message}"
                 
@@ -325,24 +344,32 @@ class ChatClientGUI:
     def receive_messages(self):
         while True:
             try:
-                data = self.client_socket.recv(4096).decode('utf-8')
+                data = self.client_socket.recv(8192).decode('utf-8')
                 if not data:
                     break
                 
-                parts = data.split('|')
-                command = parts[0]
+                pattern = r'(CONTACTS_LIST\||SECURE_MESSAGE\||HANDSHAKE_OK\||MESSAGE\||TYPING_STOP\||TYPING\||INFO\||ERRO\|)'
+                parts = re.split(pattern, data)
+                
+                messages = []
+                for i in range(1, len(parts), 2):
+                    messages.append(parts[i] + parts[i+1])
+                
+                for msg_data in messages:
+                    msg_data = msg_data.strip()
+                    if not msg_data: continue
+                    
+                    msg_parts = msg_data.split('|')
+                    command = msg_parts[0]
 
-                if command == "SECURE_MESSAGE":
-                    nonce_out = parts[1]
-                    cipher_out = parts[2]
-                    mac_out = parts[3]
-                    
-                    decrypted_outer = self.verify_and_decrypt(nonce_out, cipher_out, mac_out, self.session_aes_key, self.session_hmac_key)
-                    
-                    if decrypted_outer:
-                        inner_parts = decrypted_outer.decode('utf-8').split('|')
-                        if inner_parts[0] == "ROUTED_MSG_FROM":
-                            sender = inner_parts[1]
+                    if command == "SECURE_MESSAGE":
+                        sender = msg_parts[1]
+                        payload_b64 = msg_parts[2]
+                        
+                        inner_payload_bytes = base64.b64decode(payload_b64)
+                        inner_parts = inner_payload_bytes.decode('utf-8').split('|')
+                        
+                        if inner_parts[0] == "ROUTED_MSG":
                             nonce_in = inner_parts[2]
                             cipher_in = inner_parts[3]
                             mac_in = inner_parts[4]
@@ -358,54 +385,57 @@ class ChatClientGUI:
                                 plaintext_msg = plaintext_bytes.decode('utf-8')
                                 self.master.after(0, lambda s=sender, m=plaintext_msg: self.handle_message_received(s, m))
 
-                elif command == "HANDSHAKE_RESPONSE":
-                    server_pub_bytes = base64.b64decode(parts[1])
-                    server_pub = serialization.load_pem_public_key(server_pub_bytes)
-                    shared_secret = self.dh_private_key.exchange(server_pub)
+                    elif command == "HANDSHAKE_OK":
+                        server_pub_bytes = base64.b64decode(msg_parts[1])
+                        self.current_session_id = msg_parts[2]
+                        
+                        server_pub = x25519.X25519PublicKey.from_public_bytes(server_pub_bytes)
+                        shared_secret = self.dh_private_key.exchange(server_pub)
+                        
+                        hkdf = HKDF(
+                            algorithm=hashes.SHA256(),
+                            length=64,
+                            salt=self.dh_salt,
+                            info=b"session-keys"
+                        )
+                        key_material = hkdf.derive(shared_secret)
+                        
+                        self.session_aes_key = key_material[:32]
+                        self.session_hmac_key = key_material[32:]
+
+                    elif command == "MESSAGE":
+                        sender = msg_parts[1]
+                        message = msg_parts[2]
+                        self.master.after(0, lambda: self.handle_message_received(sender, message))
                     
-                    hkdf = HKDF(
-                        algorithm=hashes.SHA256(),
-                        length=64,
-                        salt=self.dh_salt,
-                        info=b"chat_session_keys"
-                    )
-                    key_material = hkdf.derive(shared_secret)
+                    elif command == "CONTACTS_LIST":
+                        contacts_list_data = msg_parts[1:]
+                        formatted_contacts = []
+                        for contact_entry in contacts_list_data:
+                            if ':' in contact_entry:
+                                username, status = contact_entry.split(':', 1)
+                                if username != self.current_username:
+                                    formatted_contacts.append(contact_entry)
+                        self.master.after(0, lambda: self.update_contacts_list(formatted_contacts))
+
+                    elif command == "USER_STATUS":
+                        username = msg_parts[1]
+                        status = msg_parts[2]
+                        self.master.after(0, lambda: self.update_contacts_status(username, status))
+
+                    elif command == "TYPING":
+                        sender = msg_parts[1]
+                        self.master.after(0, lambda: self.typing_label.config(text=f"{sender} está digitando..."))
+                        
+                    elif command == "TYPING_STOP":
+                        sender = msg_parts[1]
+                        self.master.after(0, lambda: self.typing_label.config(text=""))
+
+                    elif command == "INFO":
+                        self.master.after(0, lambda: messagebox.showinfo("Informação", msg_parts[1]))
                     
-                    self.session_aes_key = key_material[:32]
-                    self.session_hmac_key = key_material[32:]
-
-                elif command == "MESSAGE":
-                    sender = parts[1]
-                    message = parts[2]
-                    self.master.after(0, lambda: self.handle_message_received(sender, message))
-                
-                elif command == "CONTACTS_LIST":
-                    contacts_list_data = parts[1:]
-                    formatted_contacts = []
-                    for contact_entry in contacts_list_data:
-                        username, status = contact_entry.split(':')
-                        if username != self.current_username:
-                            formatted_contacts.append(contact_entry)
-                    self.master.after(0, lambda: self.update_contacts_list(formatted_contacts))
-
-                elif command == "USER_STATUS":
-                    username = parts[1]
-                    status = parts[2]
-                    self.master.after(0, lambda: self.update_contacts_status(username, status))
-
-                elif command == "TYPING":
-                    sender = parts[1]
-                    self.master.after(0, lambda: self.typing_label.config(text=f"{sender} está digitando..."))
-                    
-                elif command == "TYPING_STOP":
-                    sender = parts[1]
-                    self.master.after(0, lambda: self.typing_label.config(text=""))
-
-                elif command == "INFO":
-                    self.master.after(0, lambda: messagebox.showinfo("Informação", parts[1]))
-                
-                elif command == "ERROR":
-                    self.master.after(0, lambda: messagebox.showerror("Erro", parts[1]))
+                    elif command == "ERRO":
+                        self.master.after(0, lambda: messagebox.showerror("Erro do Servidor", msg_parts[1]))
 
             except socket.error:
                 break
@@ -417,6 +447,10 @@ class ChatClientGUI:
             self.update_chat_history(f"{sender}: {message}", False) 
 
     def update_contacts_list(self, contacts_with_status):
+        selected_contact = None
+        if self.contacts_listbox.curselection():
+            selected_contact = self.contacts_listbox.get(self.contacts_listbox.curselection())
+            
         self.contacts_listbox.delete(0, tk.END)
         for contact_with_status in contacts_with_status:
             if ":" in contact_with_status:
@@ -424,6 +458,11 @@ class ChatClientGUI:
                 color = "green" if status == "online" else "black"
                 self.contacts_listbox.insert(tk.END, username)
                 self.contacts_listbox.itemconfig(tk.END, {'fg': color})
+                
+                if username == selected_contact:
+                    idx = self.contacts_listbox.size() - 1
+                    self.contacts_listbox.selection_set(idx)
+                    self.contacts_listbox.activate(idx)
             else:
                 self.contacts_listbox.insert(tk.END, contact_with_status)
 
