@@ -37,7 +37,8 @@ class ChatClientGUI:
         self.dh_salt = None
         self.current_session_id = None
         
-        self.e2e_keys = {}
+        self.e2e_private_keys = {} # Chaves efêmeras para os contatos
+        self.e2e_keys = {}         # Chaves AES/HMAC definitivas da conversa
 
     def create_login_frame(self):
         frame = tk.Frame(self.master, padx=10, pady=10)
@@ -61,46 +62,55 @@ class ChatClientGUI:
 
     def sign_challenge(self, nonce_base64):
         priv_path = os.path.join("keys", f"{self.current_username}_priv.pem")
-        
         if not os.path.exists(priv_path):
             return None 
-            
         with open(priv_path, "rb") as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=None
-            )
-            
+            private_key = serialization.load_pem_private_key(key_file.read(), password=None)
         nonce_bytes = base64.b64decode(nonce_base64)
         signature = private_key.sign(nonce_bytes)
         return base64.b64encode(signature).decode('utf-8')
 
-    def execute_handshake(self):
+    def execute_handshake_sync(self):
+        print("\n[*] [ETAPA 1] Iniciando Handshake DHE com Servidor (Antes do Login)...")
         self.dh_private_key = x25519.X25519PrivateKey.generate()
-        client_pub = self.dh_private_key.public_key()
-        
-        client_pub_bytes = client_pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
+        client_pub = self.dh_private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
-        
         self.dh_salt = os.urandom(16)
         
-        msg = f"HANDSHAKE|{base64.b64encode(client_pub_bytes).decode('utf-8')}|{base64.b64encode(self.dh_salt).decode('utf-8')}"
+        msg = f"HANDSHAKE|{base64.b64encode(client_pub).decode('utf-8')}|{base64.b64encode(self.dh_salt).decode('utf-8')}"
         try:
             self.client_socket.sendall(msg.encode('utf-8'))
-        except socket.error:
-            pass
+            response = self.client_socket.recv(4096).decode('utf-8')
+            parts = response.split('|')
+            
+            if parts[0] == "HANDSHAKE_OK":
+                server_pub_bytes = base64.b64decode(parts[1])
+                self.current_session_id = parts[2]
+                server_pub = x25519.X25519PublicKey.from_public_bytes(server_pub_bytes)
+                
+                shared_secret = self.dh_private_key.exchange(server_pub)
+                hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=self.dh_salt, info=b"session-keys")
+                key_material = hkdf.derive(shared_secret)
+                
+                self.session_aes_key = key_material[:32]
+                self.session_hmac_key = key_material[32:]
+                print("[✓] [ETAPA 1] Handshake com Servidor Concluído! Tubo Seguro Ativado.")
+                return True
+            else:
+                print(f"[!] Erro no Handshake: {response}")
+                return False
+        except socket.error as e:
+            print(f"[!] Erro de rede: {e}")
+            return False
 
     def encrypt_and_mac(self, plaintext_bytes, aes_key, hmac_key):
         aesgcm = AESGCM(aes_key)
         nonce = os.urandom(12)
         ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, None)
-        
         h = hmac.HMAC(hmac_key, hashes.SHA256())
         h.update(ciphertext)
         mac = h.finalize()
-        
         return base64.b64encode(nonce).decode('utf-8'), base64.b64encode(ciphertext).decode('utf-8'), base64.b64encode(mac).decode('utf-8')
 
     def verify_and_decrypt(self, nonce_b64, ciphertext_b64, mac_b64, aes_key, hmac_key):
@@ -122,14 +132,22 @@ class ChatClientGUI:
     def login_thread_handler(self, username):
         if self.connect_to_server():
             self.current_username = username 
+            self.load_or_generate_identity() 
             
+            # PASSO OBRIGATÓRIO: HANDSHAKE ANTES DO LOGIN
+            if not self.execute_handshake_sync():
+                self.master.after(0, lambda: messagebox.showerror("Erro", "Handshake DHE falhou."))
+                self.client_socket.close()
+                return
+            
+            print(f"[*] [ETAPA 2] Tubo seguro montado. Iniciando Login Request para {username}...")
             message = f"LOGIN_REQUEST|{username}"
             self.client_socket.sendall(message.encode('utf-8'))
             
             try:
                 response = self.client_socket.recv(1024).decode('utf-8')
-                
                 if response.startswith("CHALLENGE"):
+                    print("[*] [ETAPA 3] Desafio recebido. Assinando matematicamente com Chave Privada (Ed25519)...")
                     parts = response.split('|')
                     nonce_base64 = parts[1]
                     signature_base64 = self.sign_challenge(nonce_base64)
@@ -137,12 +155,10 @@ class ChatClientGUI:
                     if signature_base64:
                         msg_resposta = f"LOGIN|{username}|{signature_base64}"
                         self.client_socket.sendall(msg_resposta.encode('utf-8'))
-                        
                         final_response = self.client_socket.recv(1024).decode('utf-8')
                         
                         if final_response.startswith("LOGIN_OK") or "LOGIN_OK" in final_response:
-                            self.load_or_generate_identity() 
-                            self.execute_handshake()
+                            print("[✓] [ETAPA 3] Login Aprovado!")
                             self.master.after(0, self.show_chat_window)
                             threading.Thread(target=self.receive_messages, daemon=True).start()
                         else:
@@ -151,7 +167,6 @@ class ChatClientGUI:
                     else:
                         self.master.after(0, lambda: messagebox.showerror("Erro", "Chave privada ausente."))
                         self.client_socket.close()
-                        
                 else:
                     self.master.after(0, lambda: messagebox.showerror("Login Falhou", response))
                     self.client_socket.close()
@@ -161,21 +176,14 @@ class ChatClientGUI:
     def handle_register(self):
         username = self.entry_username.get()
         password = self.entry_password.get()
-        
         self.current_username = username
         self.load_or_generate_identity()
-        
         pub_path = os.path.join("keys", f"{username}_pub.pem")
         with open(pub_path, "rb") as f:
             pub_pem = f.read()
-            
         public_key = serialization.load_pem_public_key(pub_pem)
-        pub_raw = public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
+        pub_raw = public_key.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
         pub_b64 = base64.b64encode(pub_raw).decode('utf-8')
-        
         if self.connect_to_server():
             message = f"REGISTER|{username}|{password}|{pub_b64}"
             self.client_socket.sendall(message.encode('utf-8'))
@@ -189,15 +197,12 @@ class ChatClientGUI:
             self.client_socket.connect((HOST, PORT))
             return True
         except socket.error as e:
-            mensagem_erro = f"Não foi possível conectar ao servidor: {e}"
-            self.master.after(0, lambda: messagebox.showerror("Erro de Conexão", mensagem_erro))
+            self.master.after(0, lambda: messagebox.showerror("Erro de Conexão", str(e)))
             return False
         
     def load_or_generate_identity(self):
         keys_dir = "keys"
-        if not os.path.exists(keys_dir):
-            os.makedirs(keys_dir)
-
+        if not os.path.exists(keys_dir): os.makedirs(keys_dir)
         priv_path = os.path.join(keys_dir, f"{self.current_username}_priv.pem")
         pub_path = os.path.join(keys_dir, f"{self.current_username}_pub.pem")
         aes_path = os.path.join(keys_dir, f"{self.current_username}_aes.key")
@@ -205,38 +210,24 @@ class ChatClientGUI:
         if not os.path.exists(priv_path):
             private_key = ed25519.Ed25519PrivateKey.generate()
             public_key = private_key.public_key()
-
             with open(priv_path, "wb") as f:
-                f.write(private_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption()
-                ))
-
+                f.write(private_key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption()))
             with open(pub_path, "wb") as f:
-                f.write(public_key.public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                ))
-
-            chave_aes = AESGCM.generate_key(bit_length=256)
+                f.write(public_key.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo))
             with open(aes_path, "wb") as f:
-                f.write(chave_aes)
+                f.write(AESGCM.generate_key(bit_length=256))
             
         with open(aes_path, "rb") as f:
             self.local_aes_key = f.read()
 
     def get_contacts_list(self):
-        message = "GET_CONTACTS"
         if self.client_socket:
-            try:
-                self.client_socket.sendall(message.encode('utf-8'))
-            except socket.error:
-                pass
+            try: self.client_socket.sendall("GET_CONTACTS".encode('utf-8'))
+            except socket.error: pass
 
     def show_chat_window(self):
         self.login_frame.destroy()
-        self.master.title(f"Chat - {self.current_username}")
+        self.master.title(f"Chat Blindado - {self.current_username}")
         self.master.geometry("800x600")
 
         main_frame = tk.Frame(self.master)
@@ -270,49 +261,55 @@ class ChatClientGUI:
         
         self.send_button = tk.Button(message_frame, text="Enviar", command=self.send_message)
         self.send_button.pack(side=tk.RIGHT)
-        
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def initiate_e2e_handshake(self, contact):
+        print(f"\n[*] [MATRIOSKA] Iniciando Negociação de Chaves Cliente-Cliente (X25519) com {contact}...")
+        if contact not in self.e2e_private_keys:
+            self.e2e_private_keys[contact] = x25519.X25519PrivateKey.generate()
+            
+        pub_bytes = self.e2e_private_keys[contact].public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        inner_content = f"E2E_STEP_1|{base64.b64encode(pub_bytes).decode('utf-8')}"
+        self._send_routed_message(contact, inner_content)
+        self.update_chat_history(f"[SISTEMA] Solicitando conexão Ponta-a-Ponta com {contact}...", False)
+
+    def _send_routed_message(self, contact, content_str):
+        nonce_out, cipher_out, mac_out = self.encrypt_and_mac(content_str.encode('utf-8'), self.session_aes_key, self.session_hmac_key)
+        payload_dict = {"nonce_b64": nonce_out, "ciphertext_b64": cipher_out, "mac_b64": mac_out, "recipient": contact}
+        final_msg = f"SECURE_MESSAGE|{json.dumps(payload_dict)}"
+        self.client_socket.sendall(final_msg.encode('utf-8'))
 
     def on_contact_select(self, event):
         selected_index = self.contacts_listbox.curselection()
         if selected_index:
             self.chatting_with = self.contacts_listbox.get(selected_index[0])
-            self.master.title(f"Chat - {self.current_username} (Conversando com {self.chatting_with})")
+            self.master.title(f"Chat Blindado - {self.current_username} (Conversando com {self.chatting_with})")
             self.chat_history.config(state='normal')
             self.chat_history.delete('1.0', tk.END)
             self.load_chat_history()
             self.chat_history.config(state='disabled')
+            
+            # Inicia o Handshake Cliente-Cliente automaticamente ao clicar
+            if self.chatting_with not in self.e2e_keys:
+                self.initiate_e2e_handshake(self.chatting_with)
 
     def send_message(self):
         message = self.message_entry.get()
         if message and self.chatting_with:
-            
             if self.chatting_with not in self.e2e_keys:
-                self.e2e_keys[self.chatting_with] = {'aes': b'0'*32, 'hmac': b'1'*32}
+                messagebox.showwarning("Aguarde", "Criptografando canal. Tente enviar em 1 segundo.")
+                self.initiate_e2e_handshake(self.chatting_with)
+                return
 
+            print(f"[*] [ENVIO] Empacotando mensagem (Camada 2 - Matrioska E2E) para {self.chatting_with}")
             e2e_aes = self.e2e_keys[self.chatting_with]['aes']
             e2e_hmac = self.e2e_keys[self.chatting_with]['hmac']
             
             nonce_in, cipher_in, mac_in = self.encrypt_and_mac(message.encode('utf-8'), e2e_aes, e2e_hmac)
-            inner_payload = f"{nonce_in}|{cipher_in}|{mac_in}"
+            inner_content = f"ROUTED_MSG|{self.chatting_with}|{nonce_in}|{cipher_in}|{mac_in}"
             
-            if self.session_aes_key and self.session_hmac_key:
-                outer_content = f"ROUTED_MSG|{self.chatting_with}|{inner_payload}"
-                nonce_out, cipher_out, mac_out = self.encrypt_and_mac(outer_content.encode('utf-8'), self.session_aes_key, self.session_hmac_key)
-                
-                payload_dict = {
-                    "nonce_b64": nonce_out,
-                    "ciphertext_b64": cipher_out,
-                    "mac_b64": mac_out,
-                    "recipient": self.chatting_with
-                }
-                final_msg = f"SECURE_MESSAGE|{json.dumps(payload_dict)}"
-            else:
-                final_msg = f"MESSAGE|{self.chatting_with}|{message}"
-                
-            self.client_socket.sendall(final_msg.encode('utf-8'))
+            self._send_routed_message(self.chatting_with, inner_content)
             self.update_chat_history(f"Você: {message}", True) 
-
             self.message_entry.delete(0, tk.END)
             self.send_typing_stop()
 
@@ -332,23 +329,18 @@ class ChatClientGUI:
             time.sleep(0.5)
 
     def send_typing(self):
-        if self.chatting_with:
-            message = f"TYPING|{self.chatting_with}"
-            self.client_socket.sendall(message.encode('utf-8'))
+        if self.chatting_with: self.client_socket.sendall(f"TYPING|{self.chatting_with}".encode('utf-8'))
 
     def send_typing_stop(self):
-        if self.chatting_with:
-            message = f"TYPING_STOP|{self.chatting_with}"
-            self.client_socket.sendall(message.encode('utf-8'))
+        if self.chatting_with: self.client_socket.sendall(f"TYPING_STOP|{self.chatting_with}".encode('utf-8'))
 
     def receive_messages(self):
         while True:
             try:
                 data = self.client_socket.recv(8192).decode('utf-8')
-                if not data:
-                    break
+                if not data: break
                 
-                pattern = r'(CONTACTS_LIST\||SECURE_MESSAGE\||HANDSHAKE_OK\||MESSAGE\||TYPING_STOP\||TYPING\||INFO\||ERRO\|)'
+                pattern = r'(CONTACTS_LIST\||SECURE_MESSAGE\||MESSAGE\||TYPING_STOP\||TYPING\||INFO\||ERRO\|)'
                 parts = re.split(pattern, data)
                 
                 messages = []
@@ -368,15 +360,11 @@ class ChatClientGUI:
                         
                         inner_payload_bytes = base64.b64decode(payload_b64)
                         inner_parts = inner_payload_bytes.decode('utf-8').split('|')
+                        command_in = inner_parts[0]
                         
-                        if inner_parts[0] == "ROUTED_MSG":
-                            nonce_in = inner_parts[2]
-                            cipher_in = inner_parts[3]
-                            mac_in = inner_parts[4]
-                            
-                            if sender not in self.e2e_keys:
-                                self.e2e_keys[sender] = {'aes': b'0'*32, 'hmac': b'1'*32}
-                            
+                        if command_in == "ROUTED_MSG":
+                            print(f"[*] [RECEBIDO] Mensagem Matrioska de {sender}. Abrindo Camada E2E...")
+                            nonce_in, cipher_in, mac_in = inner_parts[2], inner_parts[3], inner_parts[4]
                             e2e_aes = self.e2e_keys[sender]['aes']
                             e2e_hmac = self.e2e_keys[sender]['hmac']
                             
@@ -385,29 +373,42 @@ class ChatClientGUI:
                                 plaintext_msg = plaintext_bytes.decode('utf-8')
                                 self.master.after(0, lambda s=sender, m=plaintext_msg: self.handle_message_received(s, m))
 
-                    elif command == "HANDSHAKE_OK":
-                        server_pub_bytes = base64.b64decode(msg_parts[1])
-                        self.current_session_id = msg_parts[2]
-                        
-                        server_pub = x25519.X25519PublicKey.from_public_bytes(server_pub_bytes)
-                        shared_secret = self.dh_private_key.exchange(server_pub)
-                        
-                        hkdf = HKDF(
-                            algorithm=hashes.SHA256(),
-                            length=64,
-                            salt=self.dh_salt,
-                            info=b"session-keys"
-                        )
-                        key_material = hkdf.derive(shared_secret)
-                        
-                        self.session_aes_key = key_material[:32]
-                        self.session_hmac_key = key_material[32:]
+                        elif command_in == "E2E_STEP_1":
+                            print(f"\n[*] [MATRIOSKA] {sender} quer iniciar canal E2E. Calculando chaves compartilhadas...")
+                            alice_pub_bytes = base64.b64decode(inner_parts[1])
+                            alice_pub = x25519.X25519PublicKey.from_public_bytes(alice_pub_bytes)
 
-                    elif command == "MESSAGE":
-                        sender = msg_parts[1]
-                        message = msg_parts[2]
-                        self.master.after(0, lambda: self.handle_message_received(sender, message))
-                    
+                            if sender not in self.e2e_private_keys:
+                                self.e2e_private_keys[sender] = x25519.X25519PrivateKey.generate()
+                            my_priv = self.e2e_private_keys[sender]
+                            my_pub_bytes = my_priv.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+                            shared_secret = my_priv.exchange(alice_pub)
+                            hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=b"e2e-salt", info=b"e2e-keys")
+                            key_material = hkdf.derive(shared_secret)
+
+                            self.e2e_keys[sender] = {'aes': key_material[:32], 'hmac': key_material[32:]}
+                            print(f"[✓] Chaves da conversa com {sender} geradas na RAM!")
+
+                            outer_content = f"E2E_STEP_2|{base64.b64encode(my_pub_bytes).decode('utf-8')}"
+                            self._send_routed_message(sender, outer_content)
+                            self.master.after(0, lambda: self.update_chat_history(f"[SISTEMA] Canal Criptografado E2E com {sender} estabelecido!", False))
+
+                        elif command_in == "E2E_STEP_2":
+                            print(f"\n[*] [MATRIOSKA] Resposta de {sender} recebida. Finalizando o cálculo do Segredo Perfeito...")
+                            bob_pub_bytes = base64.b64decode(inner_parts[1])
+                            bob_pub = x25519.X25519PublicKey.from_public_bytes(bob_pub_bytes)
+
+                            my_priv = self.e2e_private_keys.get(sender)
+                            if my_priv:
+                                shared_secret = my_priv.exchange(bob_pub)
+                                hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=b"e2e-salt", info=b"e2e-keys")
+                                key_material = hkdf.derive(shared_secret)
+
+                                self.e2e_keys[sender] = {'aes': key_material[:32], 'hmac': key_material[32:]}
+                                print(f"[✓] Chaves da conversa com {sender} geradas na RAM!")
+                                self.master.after(0, lambda: self.update_chat_history(f"[SISTEMA] Canal Criptografado E2E com {sender} estabelecido!", False))
+
                     elif command == "CONTACTS_LIST":
                         contacts_list_data = msg_parts[1:]
                         formatted_contacts = []
@@ -417,11 +418,6 @@ class ChatClientGUI:
                                 if username != self.current_username:
                                     formatted_contacts.append(contact_entry)
                         self.master.after(0, lambda: self.update_contacts_list(formatted_contacts))
-
-                    elif command == "USER_STATUS":
-                        username = msg_parts[1]
-                        status = msg_parts[2]
-                        self.master.after(0, lambda: self.update_contacts_status(username, status))
 
                     elif command == "TYPING":
                         sender = msg_parts[1]
@@ -463,11 +459,6 @@ class ChatClientGUI:
                     idx = self.contacts_listbox.size() - 1
                     self.contacts_listbox.selection_set(idx)
                     self.contacts_listbox.activate(idx)
-            else:
-                self.contacts_listbox.insert(tk.END, contact_with_status)
-
-    def update_contacts_status(self, username, status):
-        pass
 
     def update_chat_history(self, message, is_sent_message):
         self.chat_history.config(state='normal')
@@ -509,20 +500,15 @@ class ChatClientGUI:
     def on_closing(self):
         if messagebox.askokcancel("Sair", "Tem certeza que deseja sair?"):
             if self.client_socket:
-                try:
-                    self.client_socket.sendall("LOGOUT".encode('utf-8'))
-                except socket.error:
-                    pass
-                finally:
-                    self.client_socket.close()
+                try: self.client_socket.sendall("LOGOUT".encode('utf-8'))
+                except socket.error: pass
+                finally: self.client_socket.close()
             self.master.destroy()
             
     def get_history_filename(self, contact):
         history_dir = "chat_history"
-        if not os.path.exists(history_dir):
-            os.makedirs(history_dir)
-        filename = f"history_{self.current_username}_{contact}.txt"
-        return os.path.join(history_dir, filename)
+        if not os.path.exists(history_dir): os.makedirs(history_dir)
+        return os.path.join(history_dir, f"history_{self.current_username}_{contact}.txt")
 
 if __name__ == "__main__":
     root = tk.Tk()
