@@ -20,12 +20,15 @@ PORT = 5000
 class ChatClientGUI:
     def __init__(self, master):
         self.master = master
-        master.title("Chat - Login")
+        
+        # Oculta a janela principal imediatamente ao abrir
+        self.master.withdraw()
+        
+        master.title("Chat Seguro - Login")
         self.client_socket = None
         self.current_username = None
         self.chatting_with = None
         self.contacts = {}
-        self.login_frame = self.create_login_frame()
         self.typing_status_thread = None
         self.is_typing = False
         self.last_key_press_time = 0
@@ -39,6 +42,16 @@ class ChatClientGUI:
         
         self.e2e_private_keys = {} # Chaves efêmeras para os contatos
         self.e2e_keys = {}         # Chaves AES/HMAC definitivas da conversa
+        
+        # Tenta conectar ao servidor ANTES de desenhar a tela
+        if not self.connect_to_server(is_startup=True):
+            # Se falhou, a caixa de erro já foi exibida. Apenas destruímos o app e encerramos.
+            self.master.destroy()
+            return
+            
+        # Se a conexão foi um sucesso, exibe a janela e desenha a tela de login
+        self.master.deiconify()
+        self.login_frame = self.create_login_frame()
 
     def create_login_frame(self):
         frame = tk.Frame(self.master, padx=10, pady=10)
@@ -56,6 +69,48 @@ class ChatClientGUI:
         tk.Button(frame, text="Registrar", command=self.handle_register).grid(row=2, column=1, pady=10)
         return frame
 
+    def _close_connection(self):
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+            self.client_socket = None
+
+    def connect_to_server(self, is_startup=False):
+        if self.client_socket is not None:
+            return True
+        try:
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((HOST, PORT))
+            local_ip, local_port = self.client_socket.getsockname()
+            
+            print("\n==========================================================")
+            print("[*] [SISTEMA] Inicializando o Cliente...")
+            print(f"  -> Conectando ao Servidor : {HOST}:{PORT}")
+            print(f"  -> Porta Local Alocada    : {local_port}")
+            print("[✓] Conexão TCP (Física) estabelecida com sucesso!")
+            print("==========================================================")
+            return True
+        except socket.error as e:
+            # Captura a mensagem de erro em uma string fixa para evitar o NameError do lambda
+            erro_msg = str(e)
+            print(f"\n[!] Erro fatal de conexão: {erro_msg}")
+            
+            msg_texto = (
+                f"O servidor em {HOST}:{PORT} está offline ou recusou a conexão.\n\n"
+                f"Detalhes técnicos: {erro_msg}\n\n"
+                "Verifique se o servidor (server.py) está rodando e tente abrir novamente."
+            )
+            
+            # Se for na inicialização, usamos messagebox direto pois estamos na MainThread
+            if is_startup:
+                messagebox.showerror("Servidor Offline", msg_texto)
+            else:
+                self.master.after(0, lambda err=msg_texto: messagebox.showerror("Conexão Perdida", err))
+            
+            return False
+
     def handle_login(self):
         username = self.entry_username.get()
         threading.Thread(target=self.login_thread_handler, args=(username,), daemon=True).start()
@@ -71,14 +126,22 @@ class ChatClientGUI:
         return base64.b64encode(signature).decode('utf-8')
 
     def execute_handshake_sync(self):
-        print("\n[*] [ETAPA 1] Iniciando Handshake DHE com Servidor (Antes do Login)...")
+        print("\n==========================================================")
+        print("[*] [ETAPA 1] Iniciando Handshake DHE (Antes do Login)")
+        print("==========================================================")
         self.dh_private_key = x25519.X25519PrivateKey.generate()
         client_pub = self.dh_private_key.public_key().public_bytes(
             encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
         self.dh_salt = os.urandom(16)
         
-        msg = f"HANDSHAKE|{base64.b64encode(client_pub).decode('utf-8')}|{base64.b64encode(self.dh_salt).decode('utf-8')}"
+        client_pub_b64 = base64.b64encode(client_pub).decode('utf-8')
+        salt_b64 = base64.b64encode(self.dh_salt).decode('utf-8')
+        
+        print(f"  -> Minha Chave Pública X25519: {client_pub_b64}")
+        print(f"  -> Salt Gerado para o HKDF...: {salt_b64}")
+        
+        msg = f"HANDSHAKE|{client_pub_b64}|{salt_b64}"
         try:
             self.client_socket.sendall(msg.encode('utf-8'))
             response = self.client_socket.recv(4096).decode('utf-8')
@@ -89,13 +152,16 @@ class ChatClientGUI:
                 self.current_session_id = parts[2]
                 server_pub = x25519.X25519PublicKey.from_public_bytes(server_pub_bytes)
                 
+                print(f"  <- Chave Púb. Servidor Recebida: {parts[1]}")
+                print(f"  <- ID da Sessão Criptografada..: {self.current_session_id}")
+                
                 shared_secret = self.dh_private_key.exchange(server_pub)
                 hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=self.dh_salt, info=b"session-keys")
                 key_material = hkdf.derive(shared_secret)
                 
                 self.session_aes_key = key_material[:32]
                 self.session_hmac_key = key_material[32:]
-                print("[✓] [ETAPA 1] Handshake com Servidor Concluído! Tubo Seguro Ativado.")
+                print("[✓] [ETAPA 1] Handshake com Servidor Concluído! Canal Criptografado Ativado.")
                 return True
             else:
                 print(f"[!] Erro no Handshake: {response}")
@@ -134,44 +200,52 @@ class ChatClientGUI:
             self.current_username = username 
             self.load_or_generate_identity() 
             
-            # PASSO OBRIGATÓRIO: HANDSHAKE ANTES DO LOGIN
             if not self.execute_handshake_sync():
                 self.master.after(0, lambda: messagebox.showerror("Erro", "Handshake DHE falhou."))
-                self.client_socket.close()
+                self._close_connection()
                 return
             
-            print(f"[*] [ETAPA 2] Tubo seguro montado. Iniciando Login Request para {username}...")
+            print(f"\n[*] [ETAPA 2] Canal criptografado estabelecido. Iniciando Login Request para '{username}'...")
             message = f"LOGIN_REQUEST|{username}"
             self.client_socket.sendall(message.encode('utf-8'))
             
             try:
                 response = self.client_socket.recv(1024).decode('utf-8')
                 if response.startswith("CHALLENGE"):
-                    print("[*] [ETAPA 3] Desafio recebido. Assinando matematicamente com Chave Privada (Ed25519)...")
                     parts = response.split('|')
                     nonce_base64 = parts[1]
+                    
+                    print("\n==========================================================")
+                    print("[*] [ETAPA 3] Desafio (Challenge) de Autenticação Recebido")
+                    print("==========================================================")
+                    print(f"  <- Nonce do Servidor.....: {nonce_base64}")
+                    print(f"  -> Assinando o Nonce com a Chave Privada (Ed25519)...")
+                    
                     signature_base64 = self.sign_challenge(nonce_base64)
                     
                     if signature_base64:
+                        print(f"  -> Assinatura Gerada.....: {signature_base64[:40]}... (truncado)")
                         msg_resposta = f"LOGIN|{username}|{signature_base64}"
                         self.client_socket.sendall(msg_resposta.encode('utf-8'))
                         final_response = self.client_socket.recv(1024).decode('utf-8')
                         
                         if final_response.startswith("LOGIN_OK") or "LOGIN_OK" in final_response:
-                            print("[✓] [ETAPA 3] Login Aprovado!")
+                            print("[✓] [ETAPA 3] Login Aprovado! Servidor validou a assinatura.")
                             self.master.after(0, self.show_chat_window)
                             threading.Thread(target=self.receive_messages, daemon=True).start()
                         else:
+                            print(f"[!] [ETAPA 3] Login Recusado: {final_response}")
                             self.master.after(0, lambda: messagebox.showerror("Login Falhou", final_response))
-                            self.client_socket.close()
+                            self._close_connection()
                     else:
+                        print("[!] Erro: Chave privada ausente no momento de assinar o Desafio.")
                         self.master.after(0, lambda: messagebox.showerror("Erro", "Chave privada ausente."))
-                        self.client_socket.close()
+                        self._close_connection()
                 else:
                     self.master.after(0, lambda: messagebox.showerror("Login Falhou", response))
-                    self.client_socket.close()
+                    self._close_connection()
             except socket.error:
-                pass
+                self._close_connection()
 
     def handle_register(self):
         username = self.entry_username.get()
@@ -186,19 +260,12 @@ class ChatClientGUI:
         pub_b64 = base64.b64encode(pub_raw).decode('utf-8')
         if self.connect_to_server():
             message = f"REGISTER|{username}|{password}|{pub_b64}"
-            self.client_socket.sendall(message.encode('utf-8'))
-            response = self.client_socket.recv(1024).decode('utf-8')
-            messagebox.showinfo("Registro", response)
-            self.client_socket.close()
-
-    def connect_to_server(self):
-        try:
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.client_socket.connect((HOST, PORT))
-            return True
-        except socket.error as e:
-            self.master.after(0, lambda: messagebox.showerror("Erro de Conexão", str(e)))
-            return False
+            try:
+                self.client_socket.sendall(message.encode('utf-8'))
+                response = self.client_socket.recv(1024).decode('utf-8')
+                messagebox.showinfo("Registro", response)
+            except socket.error:
+                pass
         
     def load_or_generate_identity(self):
         keys_dir = "keys"
@@ -301,7 +368,7 @@ class ChatClientGUI:
                 self.initiate_e2e_handshake(self.chatting_with)
                 return
 
-            print(f"[*] [ENVIO] Empacotando mensagem (Camada 2 - Matrioska E2E) para {self.chatting_with}")
+            print(f"\n[*] [ENVIO] Empacotando mensagem (Camada 2 - Matrioska E2E) para {self.chatting_with}")
             e2e_aes = self.e2e_keys[self.chatting_with]['aes']
             e2e_hmac = self.e2e_keys[self.chatting_with]['hmac']
             
@@ -363,7 +430,7 @@ class ChatClientGUI:
                         command_in = inner_parts[0]
                         
                         if command_in == "ROUTED_MSG":
-                            print(f"[*] [RECEBIDO] Mensagem Matrioska de {sender}. Abrindo Camada E2E...")
+                            print(f"\n[*] [RECEBIDO] Mensagem Matrioska de {sender}. Descriptografando Camada E2E...")
                             nonce_in, cipher_in, mac_in = inner_parts[2], inner_parts[3], inner_parts[4]
                             e2e_aes = self.e2e_keys[sender]['aes']
                             e2e_hmac = self.e2e_keys[sender]['hmac']
@@ -388,7 +455,7 @@ class ChatClientGUI:
                             key_material = hkdf.derive(shared_secret)
 
                             self.e2e_keys[sender] = {'aes': key_material[:32], 'hmac': key_material[32:]}
-                            print(f"[✓] Chaves da conversa com {sender} geradas na RAM!")
+                            print(f"[✓] Chaves E2E da conversa com {sender} geradas na RAM!")
 
                             outer_content = f"E2E_STEP_2|{base64.b64encode(my_pub_bytes).decode('utf-8')}"
                             self._send_routed_message(sender, outer_content)
@@ -406,7 +473,7 @@ class ChatClientGUI:
                                 key_material = hkdf.derive(shared_secret)
 
                                 self.e2e_keys[sender] = {'aes': key_material[:32], 'hmac': key_material[32:]}
-                                print(f"[✓] Chaves da conversa com {sender} geradas na RAM!")
+                                print(f"[✓] Chaves E2E da conversa com {sender} geradas na RAM!")
                                 self.master.after(0, lambda: self.update_chat_history(f"[SISTEMA] Canal Criptografado E2E com {sender} estabelecido!", False))
 
                     elif command == "CONTACTS_LIST":
@@ -435,7 +502,7 @@ class ChatClientGUI:
 
             except socket.error:
                 break
-        self.client_socket.close()
+        self._close_connection()
 
     def handle_message_received(self, sender, message):
         self.save_chat_history_direct(sender, f"{sender}: {message}")
@@ -502,7 +569,7 @@ class ChatClientGUI:
             if self.client_socket:
                 try: self.client_socket.sendall("LOGOUT".encode('utf-8'))
                 except socket.error: pass
-                finally: self.client_socket.close()
+            self._close_connection()
             self.master.destroy()
             
     def get_history_filename(self, contact):
